@@ -30,6 +30,7 @@ This is an explicit operator-first decision:
 | Firmware, power, cooling, and cabling | Hardware operations |
 | Ubuntu installation and first boot | iPXE, Autoinstall, and cloud-init |
 | Kubernetes membership and node contract | RKE2 |
+| NVIDIA runtime, device discovery, validation, and metrics | NVIDIA GPU Operator |
 | Desired cluster state | GitOps |
 | Ray cluster and Serve application lifecycle | KubeRay `RayService` controller |
 | Replica placement within Ray capacity | Ray scheduler and placement groups |
@@ -185,6 +186,21 @@ refinery work. Batch work is lower priority than interactive inference, produces
 content-addressed outputs, and cannot evict the gateway, Ray head, or minimum live
 model replicas.
 
+### RAY-FR-011: NVIDIA GPU Operator dependency
+
+NVIDIA Ray workers depend on a healthy, GitOps-managed NVIDIA GPU Operator
+installation configured for RKE2's containerd socket. The operator supplies the
+device plugin, container-toolkit integration, GPU discovery, validation, and DCGM
+metrics. Driver installation is either operator-managed or host-managed for each
+hardware class, never both.
+
+The Ray worker pod requests `nvidia.com/gpu` and does not become ready until the
+device is usable inside the container. Whether the pod specifies
+`runtimeClassName: nvidia` is determined by the pinned compatibility matrix: a
+validated CDI-based stack may not require it, while an older runtime integration
+may. Unsupported or quarantined NVIDIA nodes must not receive operator operands or
+Ray GPU workers.
+
 ## Non-functional requirements
 
 - **Isolation:** a Beowulf cluster failure cannot impair unrelated production
@@ -205,10 +221,13 @@ model replicas.
 ### Phase 0: Compatibility spike
 
 1. Select one qualified NVIDIA laptop and one small, license-compatible model.
-2. Validate the host driver, container GPU access, Ray image, and inference engine.
-3. Record cold-load time, VRAM use, sustained throughput, thermals, and failure
+2. Select host- or operator-managed driver ownership for its hardware class.
+3. Validate RKE2's containerd socket, GPU Operator operands, GPU labels,
+   `nvidia.com/gpu` capacity, a pinned CUDA sample, and DCGM metrics.
+4. Validate the Ray image and inference engine against that GPU stack.
+5. Record cold-load time, VRAM use, sustained throughput, thermals, and failure
    behavior.
-4. Pin the first supported version matrix and reject unsupported node classes.
+6. Pin the first supported version matrix and reject unsupported node classes.
 
 ### Phase 1: KubeRay foundation
 
@@ -249,6 +268,8 @@ model replicas.
 - GitOps can create and remove the complete Ray service without manual repair.
 - A model pod cannot schedule without both the laptop toleration and approved-class
   affinity.
+- GPU Operator validators are healthy and the node exposes the expected discovery
+  labels, `nvidia.com/gpu` capacity, and DCGM metrics.
 - The selected GPU is visible and exclusively accounted for inside the worker pod.
 - A client receives a correct response through the private ingress and production
   gateway path.
@@ -295,3 +316,5 @@ implementation artifact is added.
 - [Ray Serve LLM configuration](https://docs.ray.io/en/latest/serve/llm/user-guides/configuration.html)
 - [Ray Serve fault tolerance](https://docs.ray.io/en/latest/serve/production-guide/fault-tolerance.html)
 - [KubeRay documentation](https://ray-project.github.io/kuberay/)
+- [RKE2 GPU Operators](https://docs.rke2.io/add-ons/gpu_operators)
+- [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/)

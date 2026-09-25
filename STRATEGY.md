@@ -143,6 +143,56 @@ fault handling remains an explicit cordon-and-drain procedure. A custom
 consequences have been tested. Production namespaces must never contain broad
 `Exists` tolerations for project taints.
 
+### NVIDIA GPU enablement on RKE2
+
+The NVIDIA GPU Operator is the cluster-level integration for admitted NVIDIA
+workers. It owns the Kubernetes-facing GPU stack: container-runtime integration,
+the NVIDIA device plugin, GPU Feature Discovery, validation, and DCGM-based
+monitoring. Ray workloads consume the resulting `nvidia.com/gpu` extended resource;
+they do not install or reconfigure the runtime themselves.
+
+Kernel-driver ownership is selected once per hardware-class profile:
+
+| Driver mode | Provisioning responsibility | GPU Operator configuration |
+| --- | --- | --- |
+| Operator-managed | cloud-init supplies kernel prerequisites; the operator installs the validated driver | Driver operand enabled |
+| Host-managed | cloud-init installs and pins a validated mobile/legacy driver | Driver operand disabled; other operands remain enabled |
+
+The two modes must not manage the driver simultaneously. Host-managed mode remains
+available because consumer laptop GPUs and older hardware may require a driver that
+is not compatible with the operator's default driver container. A node class is
+admitted only after its exact Ubuntu, kernel, driver, RKE2/containerd, GPU Operator,
+and CUDA interface combination passes validation.
+
+The deployment must follow the RKE2-specific integration contract:
+
+- configure the NVIDIA Container Toolkit with the RKE2 containerd socket at
+  `/run/k3s/containerd/containerd.sock`;
+- pin the GPU Operator chart and operand versions through GitOps;
+- select CDI or the NVIDIA runtime class according to the validated RKE2,
+  containerd, and GPU Operator versions rather than mixing both paths implicitly;
+- modify the RKE2 service `PATH` only when required, using trusted, explicitly
+  declared directories;
+- keep experimental NRI integration disabled for the initial implementation;
+- ensure CPU, AMD, unsupported NVIDIA, and quarantined nodes are excluded from
+  NVIDIA operands, using controls such as
+  `nvidia.com/gpu.deploy.operands=false`; and
+- coordinate Node Feature Discovery ownership so it is installed exactly once.
+
+GPU Operator runtime changes can restart RKE2 on a node. Installation and upgrades
+therefore proceed one hardware class and one node at a time after cordon and drain,
+with capacity and rollback verified before continuing. An operator or driver update
+must not roll across all inference replicas simultaneously.
+
+An NVIDIA node becomes eligible for Ray only after automated checks confirm:
+
+1. the expected `nvidia.com/*` discovery labels are present;
+2. `nvidia.com/gpu` reports the expected allocatable count;
+3. the NVIDIA container runtime or CDI configuration is active;
+4. the GPU Operator validators are healthy;
+5. a pinned CUDA sample can request and exercise the GPU; and
+6. DCGM metrics and the node's thermal telemetry are visible.
+
 ## Node lifecycle
 
 ```text
@@ -408,6 +458,8 @@ an entire conversation graph into host provisioning.
 - [cloud-init user-data formats](https://cloudinit.readthedocs.io/topics/format.html)
 - [cloud-init module frequencies](https://cloudinit.readthedocs.io/en/latest/topics/modules.html)
 - [RKE2 documentation](https://docs.rke2.io/)
+- [RKE2 GPU Operators](https://docs.rke2.io/add-ons/gpu_operators)
+- [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/)
 - [KServe](https://kserve.github.io/website/)
 - [KubeRay](https://ray-project.github.io/kuberay/)
 - [Ray Serve implementation requirements](./RAY_SERVE.md)
