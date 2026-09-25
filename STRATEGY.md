@@ -1,0 +1,302 @@
+# Heterogeneous Laptop Cluster Strategy
+
+## Purpose
+
+This repository supports a collection of heterogeneous laptops used as a private,
+local AI appliance. The cluster should present a small number of stable interfaces
+to users while allowing individual machines to serve different roles according to
+their hardware, sustained performance, reliability, and economic value.
+
+The strategy has three parts:
+
+1. Treat nodes as reproducibly provisioned and replaceable.
+2. Use cloud-init to establish the host and RKE2 membership contract, then let
+   Kubernetes own application state.
+3. Use heterogeneous capacity for a model refinery and complementary inference
+   services instead of forcing every laptop into one latency-sensitive model.
+
+The cluster is not intended to make mismatched GPUs appear as a cache-coherent
+device or to preserve irreplaceable state on individual laptops.
+
+## Architectural boundaries
+
+| Layer | Owner | Examples |
+| --- | --- | --- |
+| Physical hardware | Human/vendor tooling | Firmware, BIOS/UEFI, cabling, power, cooling |
+| Installation | iPXE and Ubuntu Autoinstall | Disk layout, base operating-system image |
+| First-boot host contract | cloud-init | Identity, access, hardware profile, RKE2 configuration |
+| Cluster infrastructure | RKE2 and GitOps | CNI, GPU integration, storage classes, observability |
+| Model services | Kubernetes resources and operators | Model servers, batch jobs, routing, evaluation |
+| User interface | API gateway/application | Stable local inference and agent endpoints |
+
+Cloud-init is a first-boot mechanism, not an ongoing configuration-management
+controller. Material host drift is corrected by reprovisioning. Emergency repairs
+may be performed manually, but a repair that should survive reprovisioning must be
+encoded in the installation image, hardware-class profile, or cloud-init data.
+
+## Node lifecycle
+
+```text
+unregistered
+    -> discovered
+    -> assessed
+    -> disposition approved
+    -> provisioning
+    -> ready
+    -> active
+    -> drained
+    -> reprovisioning -> ready
+                    or -> retired
+```
+
+### 1. Unregistered
+
+The laptop has not been admitted to the fleet. No assumptions are made about its
+condition, installed operating system, storage contents, firmware, or suitability.
+
+### 2. Discovered
+
+The device receives a stable fleet identity based on recorded asset information,
+including manufacturer, model, serial number, network identities, and relevant PCI
+devices. A MAC address may select a boot profile but is not the sole durable device
+identity.
+
+### 3. Assessed
+
+The inventory and assessment process in
+[#1](https://github.com/bcit-tlu/beowulf-cluster/issues/1) records raw hardware,
+compatibility, performance, sustained thermal, network, storage, and optional power
+measurements. Results are versioned and remain separate from policy judgments.
+
+The assessment assigns factual capabilities such as:
+
+- inference backend support;
+- usable VRAM class;
+- sustained performance class;
+- wired network class;
+- storage and CPU/RAM capabilities; and
+- reliability or thermal limitations.
+
+### 4. Disposition approved
+
+The evaluation described in
+[#3](https://github.com/bcit-tlu/beowulf-cluster/issues/3) recommends whether the
+device should be retained for one or more roles, harvested for parts, or sold. The
+recommendation must identify measured facts, assumptions, missing evidence, and
+policy weights. It never initiates disposal automatically.
+
+### 5. Provisioning
+
+An independently available seed service supplies iPXE, Ubuntu Autoinstall, and
+NoCloud data. Provisioning is versioned and repeatable. The seed service must not
+depend on a cluster that is still being created; it runs on an existing management
+node, a seed cluster, or another independently bootstrapped environment. Its design
+is tracked in [#2](https://github.com/bcit-tlu/beowulf-cluster/issues/2).
+
+### 6. Ready
+
+The laptop has completed first boot, joined RKE2, passed host and GPU validation,
+and received its declared labels and taints. It is not yet assumed to be carrying a
+production workload.
+
+### 7. Active
+
+GitOps-managed cluster resources assign work that matches the node's capabilities.
+Replaceable model files and caches may reside on local NVMe; authoritative metadata,
+configuration, and evaluation results must not exist only on one laptop.
+
+### 8. Drained
+
+Workloads are evicted or completed before maintenance, reprovisioning, reassessment,
+or retirement. A node with thermal, storage, GPU, or power faults is cordoned and
+drained rather than allowed to degrade a synchronized workload.
+
+### 9. Reprovisioned or retired
+
+Host drift, incompatible driver changes, and unexplained configuration damage are
+normally resolved by returning to the provisioning state. A device that no longer
+has a defensible role returns to disposition review and may be retired.
+
+## Provisioning with Ubuntu Autoinstall and NoCloud
+
+### Seed prerequisites
+
+Before enrolling laptops, provide:
+
+- wired DHCP and DNS appropriate to the provisioning network;
+- an iPXE-compatible boot path for supported UEFI devices;
+- HTTP hosting for pinned Ubuntu installer artifacts and checksums;
+- a NoCloud endpoint capable of returning device- or class-specific data;
+- a secure mechanism for issuing RKE2 enrollment credentials; and
+- an existing management environment in which the provisioning service can run.
+
+Most laptops do not have a BMC. Network boot and installation can be automated, but
+power control, firmware setup, and boot-device selection may require physical action.
+
+### Hardware-class profiles
+
+Profiles should describe only differences that must exist below Kubernetes. Begin
+with a small set and split them only when the hardware requires it:
+
+- RKE2 server;
+- CPU-only RKE2 agent;
+- current-generation NVIDIA agent;
+- legacy NVIDIA agent; and
+- AMD/ROCm agent.
+
+Each profile pins its Ubuntu release, kernel and driver policy, RKE2 release, and
+installation artifact checksums. GPU kernel drivers may be installed in the host or
+managed by a Kubernetes operator, but responsibility must be explicit and must not
+be duplicated for the same hardware class.
+
+### Provisioning sequence
+
+1. **Select the node.** Record or confirm the durable fleet identity and approved
+   hardware class.
+2. **Network boot.** The laptop performs a UEFI PXE/iPXE boot over wired Ethernet.
+3. **Resolve the profile.** The boot service maps the device to an approved Ubuntu,
+   hardware, and RKE2 role profile. Unknown devices receive a diagnostic or
+   assessment environment, not a default destructive installation.
+4. **Load the installer.** iPXE loads pinned Ubuntu kernel and initrd artifacts and
+   passes the Autoinstall and NoCloud data-source location.
+5. **Install Ubuntu.** Autoinstall applies the declared disk layout and base image.
+   Destructive storage changes occur only after the device has been positively
+   identified and approved.
+6. **Apply first-boot configuration.** NoCloud `meta-data`, `user-data`, and optional
+   `vendor-data` establish hostname, SSH access, time synchronization, package
+   sources, required host settings, driver policy, and RKE2 configuration.
+7. **Enroll in RKE2.** The node obtains a short-lived or otherwise protected join
+   credential, configures its server or agent role, and joins the intended cluster.
+8. **Declare static capabilities.** Bootstrap configuration applies only trusted,
+   static labels and taints such as hardware class or intended control-plane role.
+   Runtime GPU and PCI facts are discovered and verified by cluster components.
+9. **Reconcile cluster services.** GitOps installs GPU device plugins/operators,
+   feature discovery, monitoring, model runtimes, caches, and workload resources.
+10. **Validate readiness.** Automated checks confirm node health, expected GPU
+    access, local storage, wired networking, sustained thermals, and a minimal
+    inference workload before the node becomes active.
+
+### Security requirements
+
+- Treat NoCloud data and boot URLs as potentially observable on the provisioning
+  network.
+- Do not commit reusable RKE2 tokens, SSH private keys, API credentials, or model
+  repository credentials.
+- Prefer per-node, short-lived enrollment material and revoke it after successful
+  admission.
+- Pin and verify installation artifacts.
+- Isolate provisioning traffic from untrusted networks.
+- Ensure an unknown device cannot select a destructive installation profile merely
+  by presenting an unrecognized MAC address.
+
+### Reproducibility and change control
+
+Provisioning inputs are reviewed and versioned together:
+
+- installer and kernel versions;
+- hardware-class profile;
+- cloud-init documents;
+- RKE2 version and configuration;
+- driver ownership and version policy; and
+- validation suite version.
+
+A profile change is tested on a representative node before broader reprovisioning.
+Rollback means redeploying the last known-good profile rather than reversing a list
+of in-place mutations.
+
+## Model refinery
+
+### Goal
+
+The model refinery converts heterogeneous, independently useful compute into better
+local AI artifacts and evidence. It emphasizes parallel work with infrequent
+coordination so that weaker nodes contribute without becoming part of every token's
+latency-critical path.
+
+The refinery complements live inference. It is not itself the user-facing chat or
+agent interface.
+
+### Refinery workflow
+
+```text
+source corpora and tasks
+        -> normalize, filter, and index
+        -> generate candidate data and responses in parallel
+        -> critique, rank, and verify
+        -> evaluate models, prompts, adapters, and quantizations
+        -> promote approved artifacts
+        -> serve through the cluster's stable local API
+```
+
+Candidate refinery workloads include:
+
+- synthetic instruction and test-data generation;
+- multiple independent candidate solutions;
+- coding, reasoning, factuality, safety, and style critique;
+- retrieval-corpus parsing, chunking, embedding, and indexing;
+- regression suites across models, prompts, and quantizations;
+- LoRA data preparation and, where supported, training;
+- quantization and conversion;
+- long-running thermal and performance qualification; and
+- shadow evaluation of proposed model-service changes.
+
+### Mapping heterogeneous hardware to work
+
+| Capability | Preferred work |
+| --- | --- |
+| Highest VRAM and bandwidth | Primary reasoning models, target/verifier models, larger training or evaluation stages |
+| Medium GPU | Coding specialists, draft models, candidate generation, reranking |
+| Small or older GPU | Embeddings, OCR, speech, classifiers, small critics, backend-specific tests |
+| CPU/RAM rich | Data preparation, tokenization, indexing, vector databases, orchestration |
+| Fast local NVMe | Replaceable model and dataset caches, intermediate artifacts |
+| Unstable or thermally limited | Short bounded jobs only, or disposition review |
+
+Several compatible high-value nodes may form a deliberately tested distributed
+model group. That group is exposed as one backend to the gateway; it does not define
+the architecture of the entire fleet.
+
+### Execution and artifact principles
+
+- Use Kubernetes Jobs or an appropriate batch controller for finite refinery stages.
+- Make each stage restartable and content-address its inputs and outputs.
+- Record model, prompt, sampler, seed, runtime, driver, benchmark, and policy versions.
+- Separate generated candidates from accepted training or evaluation artifacts.
+- Promote artifacts only after declared evaluation gates pass.
+- Store authoritative results outside ephemeral node-local caches.
+- Measure useful output, quality, latency, sustained throughput, and energy where
+  possible; raw token throughput alone is not a promotion criterion.
+
+### Single-interface presentation
+
+Users and applications interact with a stable local API. The gateway may route a
+request to:
+
+- a replicated independent model;
+- a coding or reasoning specialist;
+- a draft/target speculative pair;
+- retrieval, embedding, vision, or speech services; or
+- a distributed large-model backend composed of a compatible subset of nodes.
+
+Agent roles such as coder, reasoner, and critic belong to the application workflow.
+Kubernetes resources describe and operate model capabilities; they should not encode
+an entire conversation graph into host provisioning.
+
+## Initial implementation order
+
+1. Complete the fleet inventory and assessment work in #1.
+2. Define disposition policy in #3 and select the initial retained fleet.
+3. Implement and validate the seed iPXE/NoCloud service in #2.
+4. Provision a small RKE2 cluster from representative hardware classes.
+5. Establish GPU discovery, node classification, monitoring, and local model caches.
+6. Expose one independent model through the stable local API.
+7. Add one refinery workflow with reproducible inputs, outputs, and evaluation.
+8. Evaluate distributed inference only on compatible subsets and retain it only when
+   it improves a declared capacity, latency, throughput, or research objective.
+
+## References
+
+- [cloud-init user-data formats](https://cloudinit.readthedocs.io/topics/format.html)
+- [cloud-init module frequencies](https://cloudinit.readthedocs.io/en/latest/topics/modules.html)
+- [RKE2 documentation](https://docs.rke2.io/)
+- [KServe](https://kserve.github.io/website/)
+- [KubeRay](https://ray-project.github.io/kuberay/)
