@@ -7,12 +7,14 @@ local AI appliance. The cluster should present a small number of stable interfac
 to users while allowing individual machines to serve different roles according to
 their hardware, sustained performance, reliability, and economic value.
 
-The strategy has three parts:
+The strategy has four parts:
 
 1. Treat nodes as reproducibly provisioned and replaceable.
 2. Use cloud-init to establish the host and RKE2 membership contract, then let
    Kubernetes own application state.
-3. Use heterogeneous capacity for a model refinery and complementary inference
+3. Keep the laptop fleet in a dedicated cluster and integrate it with production
+   through a narrow, authenticated model-service API.
+4. Use heterogeneous capacity for a model refinery and complementary inference
    services instead of forcing every laptop into one latency-sensitive model.
 
 The cluster is not intended to make mismatched GPUs appear as a cache-coherent
@@ -33,6 +35,113 @@ Cloud-init is a first-boot mechanism, not an ongoing configuration-management
 controller. Material host drift is corrected by reprovisioning. Emergency repairs
 may be performed manually, but a repair that should survive reprovisioning must be
 encoded in the installation image, hardware-class profile, or cloud-init data.
+
+## Cluster isolation and production integration
+
+### Dedicated-cluster decision
+
+The laptop fleet runs as a dedicated RKE2 cluster. Laptop nodes do not join the
+production `stable` Kubernetes control plane, and the two clusters do not share
+etcd, CNI, storage, service accounts, admission webhooks, or cluster-scoped
+operators.
+
+Appropriate power, cooling, and wired networking make laptops better workers, but
+do not make their firmware, batteries, consumer GPUs, kernels, or driver lifecycle
+part of an acceptable production failure domain. A separate cluster also allows
+GPU operators, Ray, experimental schedulers, and accelerated runtimes to evolve
+without coupling their upgrade cadence to production.
+
+The existing non-production clusters may host a short-lived canary node when an
+integration must be tested against an existing platform. They are not the
+permanent home of the laptop fleet.
+
+### Integration boundary
+
+```text
+production applications
+        |
+        v
+production LLM gateway
+        |
+        | private authenticated model API
+        v
+Beowulf ingress / inference gateway
+        |
+        +-- Ray Serve model services
+        +-- other approved inference backends
+        `-- model-refinery outputs promoted for serving
+```
+
+Production applications continue to use the production LLM gateway. That gateway
+may route approved model aliases to an OpenAI-compatible endpoint exposed by the
+Beowulf cluster over a private network. Authentication and encryption terminate at
+the cluster boundary; internal model services are not exposed directly.
+
+The boundary must ensure that:
+
+- loss of every laptop removes only the corresponding local-model routes and does
+  not impair unrelated production workloads;
+- production retains an explicit timeout, circuit-breaker, and fallback policy;
+- neither cluster receives administrator credentials for the other;
+- only the credentials needed to invoke an approved endpoint cross the boundary;
+- model artifacts and telemetry use narrowly scoped identities; and
+- dashboards, Ray control APIs, Kubernetes APIs, and node services remain private.
+
+### Recommended cluster topology
+
+| Component | Placement | Responsibility |
+| --- | --- | --- |
+| Seed provisioning service | Independently bootstrapped management environment | iPXE, Ubuntu Autoinstall, and NoCloud data |
+| RKE2 control plane and etcd | Three reliable, always-on systems or VMs | Dedicated Beowulf cluster state |
+| Service worker pool | Reliable non-laptop nodes where available | Ingress, Ray head pods, operators, and supporting services |
+| GPU worker pools | Qualified laptops grouped by compatible hardware class | Ray workers and model replicas |
+| CPU worker pool | Qualified CPU/RAM-rich laptops | Data preparation, routing, indexing, and batch work |
+| Artifact storage | Replicated service outside disposable node-local caches | Authoritative models, metadata, and refinery outputs |
+
+Control-plane nodes do not run model workloads. If a non-laptop service-worker pool
+is unavailable, the most reliable qualified machines may host Ray head and gateway
+pods, but those roles remain isolated from GPU replicas and are replicated or
+recoverable. Node-local NVMe is a cache, never the only copy of an artifact.
+
+### Labels, taints, and admission policy
+
+Every laptop worker is admitted with this baseline taint:
+
+```text
+beowulf.bcit.ca/laptop=true:NoSchedule
+```
+
+Only workloads designed to tolerate loss of a laptop may tolerate it. A toleration
+makes a workload eligible for a tainted node; it does not select the correct node.
+Model and refinery workloads therefore require both an explicit toleration and
+required node affinity for an approved hardware class.
+
+Hardware and policy are represented separately:
+
+- trusted administrative labels record hardware class, reliability tier, and
+  admitted workload roles;
+- Node Feature Discovery and GPU components report observed runtime capabilities;
+- Kubernetes extended resources represent consumable devices such as GPUs; and
+- Ray worker groups expose only the resources provided by their selected nodes.
+
+Security-sensitive placement labels use a prefix protected by the Kubernetes
+`NodeRestriction` admission plugin, for example:
+
+```text
+beowulf.bcit.ca.node-restriction.kubernetes.io/hardware-class=nvidia-modern
+beowulf.bcit.ca.node-restriction.kubernetes.io/reliability-tier=qualified
+beowulf.bcit.ca.node-restriction.kubernetes.io/workload-role=inference
+```
+
+Cluster bootstrap validation must confirm that the Node authorizer and
+`NodeRestriction` admission plugin enforce this protection before these labels are
+used for workload isolation.
+
+Additional quarantine or experimental taints may prevent new scheduling, but node
+fault handling remains an explicit cordon-and-drain procedure. A custom
+`NoExecute` taint must not be applied automatically until its eviction and storage
+consequences have been tested. Production namespaces must never contain broad
+`Exists` tolerations for project taints.
 
 ## Node lifecycle
 
@@ -288,7 +397,8 @@ an entire conversation graph into host provisioning.
 3. Implement and validate the seed iPXE/NoCloud service in #2.
 4. Provision a small RKE2 cluster from representative hardware classes.
 5. Establish GPU discovery, node classification, monitoring, and local model caches.
-6. Expose one independent model through the stable local API.
+6. Install the KubeRay operator and expose one independent model with a
+   `RayService`, following the [Ray Serve implementation requirements](./RAY_SERVE.md).
 7. Add one refinery workflow with reproducible inputs, outputs, and evaluation.
 8. Evaluate distributed inference only on compatible subsets and retain it only when
    it improves a declared capacity, latency, throughput, or research objective.
@@ -300,3 +410,4 @@ an entire conversation graph into host provisioning.
 - [RKE2 documentation](https://docs.rke2.io/)
 - [KServe](https://kserve.github.io/website/)
 - [KubeRay](https://ray-project.github.io/kuberay/)
+- [Ray Serve implementation requirements](./RAY_SERVE.md)
